@@ -58,8 +58,8 @@ def http_get(url, retries=3):
                 continue
             raise
 
-def search(q):
-    u = BASE + "/api/public/search?q=" + urllib.parse.quote(q)
+def search(q, page=1):
+    u = BASE + "/api/public/search?q=" + urllib.parse.quote(q) + "&page=" + str(page)
     return http_get(u)
 
 def detail(link):
@@ -68,22 +68,43 @@ def detail(link):
 
 def main():
     links = {}
+    if os.path.exists(OUT):
+        with open(OUT, "r", encoding="utf-8") as source:
+            old = json.load(source)
+        for item in old.get("items", []):
+            link = item.get("link")
+            if link:
+                links[link] = {
+                    "title": item.get("title", ""),
+                    "tags": item.get("tags", []),
+                    "reply_count": item.get("reply_count", 0),
+                }
+        print(f"沿用已有 {len(links)} 条记录，后续仅补充新增帖子", flush=True)
     # 第一阶段：搜索，收集候选
     print("=== 阶段1: 关键词搜索 ===", flush=True)
     for i, kw in enumerate(KEYWORDS):
         try:
-            d = search(kw)
-            for r in d.get("results", []):
-                l = r.get("link")
-                if l and l not in links:
-                    links[l] = {
-                        "title": r.get("title", ""),
-                        "tags": r.get("tags", []),
-                        "preview": r.get("preview", ""),
-                        "match_type": r.get("match_type", ""),
-                        "reply_count": r.get("reply_count", 0),
-                    }
-            print(f"  [{i+1}/{len(KEYWORDS)}] {kw}: +{len(d.get('results',[]))} (累计 {len(links)})", flush=True)
+            page = 1
+            found = 0
+            while True:
+                d = search(kw, page)
+                rows = d.get("results", [])
+                for r in rows:
+                    l = r.get("link")
+                    if l and l not in links:
+                        links[l] = {
+                            "title": r.get("title", ""),
+                            "tags": r.get("tags", []),
+                            "preview": r.get("preview", ""),
+                            "match_type": r.get("match_type", ""),
+                            "reply_count": r.get("reply_count", 0),
+                        }
+                found += len(rows)
+                if not d.get("hasMore"):
+                    break
+                page += 1
+                time.sleep(2.2)
+            print(f"  [{i+1}/{len(KEYWORDS)}] {kw}: {found} 条 / {page} 页 (累计 {len(links)})", flush=True)
         except Exception as e:
             print(f"  [{i+1}/{len(KEYWORDS)}] {kw}: ERROR {e}", flush=True)
         time.sleep(2.2)  # 限流 30/min
@@ -91,9 +112,12 @@ def main():
     print(f"\n共收集候选 {len(links)} 条，开始拉取详情...", flush=True)
 
     # 第二阶段：拉取完整问答
-    qa_list = []
+    qa_list = list(old.get("items", [])) if "old" in locals() else []
+    present = {item.get("link") for item in qa_list}
     failed = []
     for idx, (link, meta) in enumerate(links.items()):
+        if link in present:
+            continue
         try:
             d = detail(link)
             posts = d.get("posts", [])
@@ -102,13 +126,14 @@ def main():
             for p in posts:
                 qt = p.get("question_text", "").strip()
                 ct = p.get("comment_text", "").strip()
-                if ct:  # 有回复才算有效
+                author = p.get("author", "")
+                if ct and author.casefold() in ("chenyiwei", "陈奕蔚", "陈版主"):
                     qa_pairs.append({
                         "q_author": p.get("question_author", ""),
                         "q_time": p.get("question_time", ""),
                         "question": qt,
                         "comment": ct,
-                        "a_author": p.get("author", "陈版主"),
+                        "a_author": author,
                         "a_time": p.get("comment_time", ""),
                     })
             if qa_pairs:
@@ -124,6 +149,7 @@ def main():
                 failed.append(link)
             if (idx + 1) % 20 == 0:
                 print(f"  详情 {idx+1}/{len(links)} 完成，有效 {len(qa_list)}", flush=True)
+                save_snapshot(qa_list, failed)
         except Exception as e:
             failed.append(link)
             print(f"  detail ERROR {link}: {e}", flush=True)
@@ -137,11 +163,30 @@ def main():
         "failed": len(failed),
         "items": qa_list,
     }
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=1)
+    save_snapshot(qa_list, failed)
     print(f"\n=== 完成 === 有效 {len(qa_list)} 条，失败 {len(failed)} 条")
     print(f"输出: {OUT}")
+
+def save_snapshot(items, failed):
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    result = {
+        "source": "中国会计视野论坛 陈奕蔚(chenyiwei)版主答疑",
+        "source_api": BASE,
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total": len(items),
+        "failed": len(failed),
+        "items": items,
+    }
+    if os.path.exists(OUT):
+        with open(OUT, "r", encoding="utf-8") as source:
+            previous = json.load(source)
+        for key, value in previous.items():
+            if key not in result and key != "items":
+                result[key] = value
+    tmp = OUT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, OUT)
 
 if __name__ == "__main__":
     main()
